@@ -24,19 +24,19 @@ An autonomous tool designed to scrape Google Maps for businesses and identify po
 
 ## Usage
 
-### Graphical Interface (GUI)
+### Graphical Interface 
 Run the following command to launch the user-friendly interface:
 ```bash
 python gui.py
 ```
 
-### Command Line Interface (CLI)
+### Command Line Interface 
 Run the scraper for a specific location:
 ```bash
 python scraper.py "Toledo, Ohio" --limit 20
 ```
 
-#### CLI Arguments:
+####  Usage:
 - `location`: The city or area to search.
 - `--limit`: Max results per category (default: 20).
 - `--file`: Path to a `.txt` file with locations (one per line).
