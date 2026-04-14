@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Project Specific
+leads.csv
+scraper.log
+progress.json
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
