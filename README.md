@@ -4,7 +4,7 @@ An autonomous tool designed to scrape Google Maps for businesses and identify po
 
 ## Features
 - **Dual Interface:** Use the command-line (CLI) or the built-in Graphical User Interface (GUI).
-- **Smart Filtering:** Automatically excludes major chains (McDonald's, Starbucks, etc.).
+- **Smart Filtering:** Automatically excludes major chains (McDonald's, Starbucks, etc.). You'll probably have to add more to this list in filter.txt
 - **Lead Validation:** Checks if a business's website is active. Only saves leads that need digital help.
 - **Data Capture:** Extracts Name, Phone, Email (if available), and Website.
 - **Deduplication:** Prevents duplicate entries and tracks progress across multiple runs.
