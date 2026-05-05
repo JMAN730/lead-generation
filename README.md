@@ -15,15 +15,17 @@ An autonomous tool designed to scrape Google Maps for businesses and identify po
    ```bash
    python -m venv venv
    ```
-2. **Install dependencies:**
-   - Windows: `.\venv\Scripts\pip install -r requirements.txt`
-   - Linux/macOS: `./venv/bin/pip install -r requirements.txt`
-3. **Install Playwright browser:**
-   - Windows: `.\venv\Scripts\playwright install chromium`
-   - Linux/macOS: `./venv/bin/playwright install chromium`
-4. ## Start the virtual environment 
+2. ## Start the virtual environment 
   - Linux/mac: source venv/bin/activate
   - Windows: venv\Scripts\activate
+
+3. **Install dependencies:**
+   - Windows: `.\venv\Scripts\pip install -r requirements.txt`
+   - Linux/macOS: `./venv/bin/pip install -r requirements.txt`
+4. **Install Playwright browser:**
+   - Windows: `.\venv\Scripts\playwright install chromium`
+   - Linux/macOS: `./venv/bin/playwright install chromium`
+
 ## Usage
 
 ### Graphical Interface 
