@@ -21,7 +21,7 @@ EXCLUDED_CHAINS = [
 
 CATEGORIES = [
     "Mobile Mechanics", 
-    "Power washing Business", 
+    "Power washing ", 
     "landscaping", 
     "Tree Removal", 
     "Cleaning", 
@@ -239,17 +239,19 @@ async def process_category(browser_context, http_client, location, category, lim
     progress_set.add((location, category))
     save_progress(output_dir, progress_set)
 
-async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None):
+async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None, categories=None):
+    if categories is None:
+        categories = CATEGORIES
     os.makedirs(output_dir, exist_ok=True)
-    
+
     progress_set = load_progress(output_dir)
     # Load all existing leads once to keep deduplication consistent
     existing_leads = load_existing_leads(os.path.join(output_dir, "leads.csv"))
-    
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        
+
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             for location in locations:
                 if stop_check and stop_check(): break
@@ -259,14 +261,14 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
 
                 if concurrency > 1:
                     # Parallel across categories
-                    chunks = [CATEGORIES[i:i + concurrency] for i in range(0, len(CATEGORIES), concurrency)]
+                    chunks = [categories[i:i + concurrency] for i in range(0, len(categories), concurrency)]
                     for chunk in chunks:
                         if stop_check and stop_check(): break
                         tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set) for cat in chunk]
                         await asyncio.gather(*tasks)
                 else:
                     # Sequential across categories
-                    for category in CATEGORIES:
+                    for category in categories:
                         if stop_check and stop_check(): break
                         await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set)
 
