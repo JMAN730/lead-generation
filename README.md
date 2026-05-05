@@ -22,7 +22,8 @@ An autonomous tool designed to scrape Google Maps for businesses and identify po
    - Windows: `.\venv\Scripts\playwright install chromium`
    - Linux/macOS: `./venv/bin/playwright install chromium`
 4. start the virtual environment 
-  - source venv/bin/activate
+  - Linux/mac: source venv/bin/activate
+  - Windows:venv\Scripts\activate
 ## Usage
 
 ### Graphical Interface 
