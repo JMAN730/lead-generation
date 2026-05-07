@@ -7,6 +7,7 @@ import argparse
 import re
 import os
 import json
+from datetime import datetime
 
 # List of popular chains to exclude
 EXCLUDED_CHAINS = [
@@ -20,13 +21,14 @@ EXCLUDED_CHAINS = [
 ]
 
 CATEGORIES = [
-    "Mobile Mechanics", 
-    "Power washing ", 
-    "landscaping", 
-    "Tree Removal", 
-    "Cleaning", 
-    "Concrete", 
-    "Fencing Companies"
+    "Mobile Mechanics",
+    "Power washing ",
+    "landscaping",
+    "Tree Removal",
+    "Cleaning",
+    "Concrete",
+    "Fencing Companies",
+    "Barbers"
 ]
 
 EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
@@ -59,11 +61,11 @@ async def get_business_details(browser_context, maps_url, semaphore):
     """Opens a fresh page for the specific Maps URL to ensure correct details."""
     async with semaphore:
         page = await browser_context.new_page()
-        details = {"phone": None, "website": None, "email": None}
+        details = {"phone": None, "website": None, "email": None, "rating": None, "reviews": None}
         try:
             await page.goto(maps_url)
             await page.wait_for_selector("div[role='main']", timeout=10000)
-            
+
             panel = await page.query_selector("div[role='main']")
             if panel:
                 phone_el = await panel.query_selector("button[data-item-id^='phone:tel:'], a[href^='tel:']")
@@ -74,7 +76,7 @@ async def get_business_details(browser_context, maps_url, semaphore):
                     else:
                         phone_href = await phone_el.get_attribute("href")
                         if phone_href: details["phone"] = phone_href.replace("tel:", "")
-                
+
                 text = await panel.inner_text()
                 if not details["phone"]:
                     match = re.search(r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text)
@@ -87,59 +89,79 @@ async def get_business_details(browser_context, maps_url, semaphore):
                 ws_el = await panel.query_selector("a[data-item-id='authority'], a[aria-label*='website'], a[aria-label*='Website']")
                 if ws_el:
                     details["website"] = await ws_el.get_attribute("href")
+
+                # Extract rating and review count
+                rating_match = re.search(r'(\d\.\d)\s*\((\d[\d,]*)\s*reviews?\)', text, re.IGNORECASE)
+                if not rating_match:
+                    # Try alternate pattern: rating and review count on separate lines
+                    rating_match = re.search(r'(\d\.\d)\s*\n\s*\(?([\d,]+)\)?', text)
+                if rating_match:
+                    details["rating"] = float(rating_match.group(1))
+                    details["reviews"] = int(rating_match.group(2).replace(',', ''))
+                else:
+                    # Try aria-label on rating element
+                    rating_el = await panel.query_selector("[aria-label*='stars'], [aria-label*=' star']")
+                    if rating_el:
+                        aria = await rating_el.get_attribute("aria-label")
+                        if aria:
+                            r = re.search(r'([\d.]+)\s*star', aria, re.IGNORECASE)
+                            if r:
+                                details["rating"] = float(r.group(1))
         except Exception as e:
-            # print(f"Error getting details for {maps_url}: {e}")
             pass
         finally:
-            await page.close()
+            if not page.is_closed():
+                await page.close()
         return details
 
 async def scrape_gmaps(browser_context, search_query, max_results=50):
     page = await browser_context.new_page()
     print(f"Searching: {search_query}")
-    await page.goto(f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}")
-    
     try:
-        consent = await page.wait_for_selector("button:has-text('Accept all')", timeout=5000)
-        if consent: await consent.click()
-    except: pass
-    
-    try: await page.wait_for_selector("div[role='feed']", timeout=15000)
-    except: pass
-    
-    found_places = []
-    visited_urls = set()
-    
-    while len(found_places) < max_results:
-        links = await page.query_selector_all("a[href^='https://www.google.com/maps/place/']")
-        if not links: break
+        await page.goto(f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}")
 
-        for link in links:
-            if len(found_places) >= max_results: break
-            url = await link.get_attribute("href")
-            if url in visited_urls: continue
-            visited_urls.add(url)
-            
-            name = await link.get_attribute("aria-label") or await link.inner_text()
-            if is_chain(name): continue
-            
-            found_places.append({"Name": name, "URL": url})
+        try:
+            consent = await page.wait_for_selector("button:has-text('Accept all')", timeout=5000)
+            if consent: await consent.click()
+        except: pass
 
-        feed = await page.query_selector("div[role='feed']")
-        if feed:
-            await feed.evaluate("el => el.scrollBy(0, 1000)")
-            await asyncio.sleep(2)
-            if await page.query_selector("text='reached the end'"): break
-        else: break
-    
-    await page.close()
+        try: await page.wait_for_selector("div[role='feed']", timeout=15000)
+        except: pass
+
+        found_places = []
+        visited_urls = set()
+
+        while len(found_places) < max_results:
+            links = await page.query_selector_all("a[href^='https://www.google.com/maps/place/']")
+            if not links: break
+
+            for link in links:
+                if len(found_places) >= max_results: break
+                url = await link.get_attribute("href")
+                if url in visited_urls: continue
+                visited_urls.add(url)
+
+                name = await link.get_attribute("aria-label") or await link.inner_text()
+                if is_chain(name): continue
+
+                found_places.append({"Name": name, "URL": url})
+
+            feed = await page.query_selector("div[role='feed']")
+            if feed:
+                await feed.evaluate("el => el.scrollBy(0, 1000)")
+                await asyncio.sleep(2)
+                if await page.query_selector("text='reached the end'"): break
+            else: break
+    finally:
+        if not page.is_closed():
+            await page.close()
 
     print(f"Collected {len(found_places)} places for '{search_query}'. Fetching details in parallel...")
-    
+
     details_semaphore = asyncio.Semaphore(5)
     tasks = [get_business_details(browser_context, p["URL"], details_semaphore) for p in found_places]
     results_details = await asyncio.gather(*tasks)
-    
+
     final_results = []
     for place, details in zip(found_places, results_details):
         if details["phone"]:
@@ -147,9 +169,11 @@ async def scrape_gmaps(browser_context, search_query, max_results=50):
                 "Name": place["Name"],
                 "Phone": details["phone"],
                 "Website": details["website"],
-                "Email": details["email"]
+                "Email": details["email"],
+                "Rating": details["rating"],
+                "Reviews": details["reviews"]
             })
-    
+
     return final_results
 
 def load_existing_leads(output_path):
@@ -176,15 +200,20 @@ def save_progress(output_dir, completed_set):
     with open(progress_path, 'w') as f:
         json.dump(list(completed_set), f)
 
-async def process_category(browser_context, http_client, location, category, limit, output_dir, existing_leads, progress_set):
+async def process_category(browser_context, http_client, location, category, limit, output_dir, existing_leads, progress_set, output_file):
     if (location, category) in progress_set:
         print(f"Skipping {category} in {location} (already completed)")
         return
 
     search_query = f"{category} in {location}"
     print(f"\n--- Processing: {search_query} ---")
-    
-    data = await scrape_gmaps(browser_context, search_query, limit)
+
+    try:
+        data = await asyncio.wait_for(scrape_gmaps(browser_context, search_query, limit), timeout=180)
+    except asyncio.TimeoutError:
+        print(f"Timed out scraping {category} in {location}. Skipping (will retry on next run).")
+        return
+
     if not data:
         print(f"No businesses with phone numbers found for {category} in {location}.")
         progress_set.add((location, category))
@@ -193,18 +222,20 @@ async def process_category(browser_context, http_client, location, category, lim
 
     # Parallel website check
     check_semaphore = asyncio.Semaphore(10)
-    
+
     async def process_lead(b):
         if (b["Name"], b["Phone"]) in existing_leads:
             return None
-        
+
         is_valid_ws = await check_website(http_client, b["Website"], check_semaphore)
         if not is_valid_ws:
             return {
-                "Name": b["Name"], 
-                "Phone": b["Phone"], 
+                "Name": b["Name"],
+                "Phone": b["Phone"],
                 "Email": b["Email"],
-                "Website": b["Website"]
+                "Website": b["Website"],
+                "Rating": b.get("Rating"),
+                "Reviews": b.get("Reviews")
             }
         return None
 
@@ -212,41 +243,42 @@ async def process_category(browser_context, http_client, location, category, lim
     new_leads = [r for r in await asyncio.gather(*tasks) if r]
 
     if new_leads:
-        output_path = os.path.join(output_dir, "leads.csv")
-        
+        output_path = os.path.join(output_dir, output_file)
+
         df_new = pd.DataFrame(new_leads)
         df_new["Category"] = category
         df_new["Location"] = location
-        
+
         if os.path.exists(output_path):
             df_existing = pd.read_csv(output_path)
-            # Ensure missing columns are handled during concat
             df_final = pd.concat([df_existing, df_new], ignore_index=True).drop_duplicates(subset=["Name", "Phone"])
         else:
             df_final = df_new
-        
-        # Reorder columns for better readability
-        cols = ["Name", "Phone", "Email", "Website", "Category", "Location"]
+
+        cols = ["Name", "Phone", "Email", "Website", "Rating", "Reviews", "Category", "Location"]
         df_final = df_final[[c for c in cols if c in df_final.columns]]
-        
+
         df_final.to_csv(output_path, index=False)
         for l in new_leads:
             existing_leads.add((l["Name"], l["Phone"]))
         print(f"Saved {len(new_leads)} new leads for {category} in {location}.")
     else:
         print(f"No new leads found for {category} in {location}.")
-    
+
     progress_set.add((location, category))
     save_progress(output_dir, progress_set)
 
-async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None, categories=None):
+async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None, categories=None, output_file=None):
     if categories is None:
         categories = CATEGORIES
+    if output_file is None:
+        output_file = f"leads_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     os.makedirs(output_dir, exist_ok=True)
 
+    print(f"Output file: {os.path.join(output_dir, output_file)}")
+
     progress_set = load_progress(output_dir)
-    # Load all existing leads once to keep deduplication consistent
-    existing_leads = load_existing_leads(os.path.join(output_dir, "leads.csv"))
+    existing_leads = load_existing_leads(os.path.join(output_dir, output_file))
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -260,17 +292,15 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
                 print(f"{'#'*60}")
 
                 if concurrency > 1:
-                    # Parallel across categories
                     chunks = [categories[i:i + concurrency] for i in range(0, len(categories), concurrency)]
                     for chunk in chunks:
                         if stop_check and stop_check(): break
-                        tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set) for cat in chunk]
+                        tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set, output_file) for cat in chunk]
                         await asyncio.gather(*tasks)
                 else:
-                    # Sequential across categories
                     for category in categories:
                         if stop_check and stop_check(): break
-                        await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set)
+                        await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set, output_file)
 
         await browser.close()
 
@@ -285,6 +315,7 @@ async def main():
     parser.add_argument("--file", help="File containing locations (one per line)")
     parser.add_argument("--limit", type=int, default=20, help="Limit per category per location")
     parser.add_argument("--output-dir", default=".", help="Directory to save leads (default: current folder)")
+    parser.add_argument("--output-file", default=None, help="Filename for the CSV output (default: timestamped leads_YYYYMMDD_HHMMSS.csv)")
     parser.add_argument("--concurrency", type=int, default=1, help="Number of categories to process in parallel per location")
     args = parser.parse_args()
 
@@ -298,7 +329,7 @@ async def main():
         print("Please provide a location or a file with locations.")
         sys.exit(1)
 
-    await run_scraper(locations, args.limit, args.output_dir, args.concurrency)
+    await run_scraper(locations, args.limit, args.output_dir, args.concurrency, output_file=args.output_file)
 
 if __name__ == "__main__":
     asyncio.run(main())
