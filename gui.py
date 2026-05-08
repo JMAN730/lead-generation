@@ -32,6 +32,7 @@ class ScraperGUI:
         style.configure("TLabel", font=("Segoe UI", 10))
         
         self.stop_requested = False
+        self._restart_after_stop = False
         self.create_widgets()
         
         # Redirect stdout
@@ -66,6 +67,11 @@ class ScraperGUI:
         self.concurrency_var = tk.IntVar(value=1)
         ttk.Spinbox(settings_frame, from_=1, to=5, textvariable=self.concurrency_var, width=10).grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
 
+        ttk.Label(settings_frame, text="Output Filename:").grid(row=2, column=0, sticky=tk.W)
+        self.output_file_var = tk.StringVar()
+        ttk.Entry(settings_frame, textvariable=self.output_file_var, width=40).grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(settings_frame, text="(leave blank for timestamped file)", font=("Segoe UI", 8)).grid(row=2, column=2, sticky=tk.W)
+
         # Categories Editor
         cat_frame = ttk.LabelFrame(main_frame, text="Categories", padding="10")
         cat_frame.pack(fill=tk.X, pady=5)
@@ -99,6 +105,9 @@ class ScraperGUI:
 
         self.stop_btn = ttk.Button(ctrl_frame, text="Stop", command=self.stop_scraping, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
+
+        self.restart_btn = ttk.Button(ctrl_frame, text="Save & Restart", command=self.save_and_restart, state=tk.DISABLED)
+        self.restart_btn.pack(side=tk.LEFT, padx=5)
 
         ttk.Button(ctrl_frame, text="Clear Logs", command=self.clear_logs).pack(side=tk.LEFT, padx=5)
         
@@ -145,13 +154,23 @@ class ScraperGUI:
     def stop_scraping(self):
         self.stop_requested = True
         self.stop_btn.config(state=tk.DISABLED)
+        self.restart_btn.config(state=tk.DISABLED)
         print("\nStopping... please wait for the current category to finish.")
+
+    def save_and_restart(self):
+        """Stop the current run (progress is saved) then automatically restart."""
+        self._restart_after_stop = True
+        self.stop_requested = True
+        self.stop_btn.config(state=tk.DISABLED)
+        self.restart_btn.config(state=tk.DISABLED)
+        print("\nSaving progress and restarting... please wait for the current category to finish.")
 
     def start_scraping(self):
         location = self.location_var.get().strip()
         file_path = self.file_var.get().strip()
         limit = self.limit_var.get()
         concurrency = self.concurrency_var.get()
+        output_file = self.output_file_var.get().strip() or None
 
         locations = []
         if file_path:
@@ -173,16 +192,18 @@ class ScraperGUI:
             return
 
         self.stop_requested = False
+        self._restart_after_stop = False
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        thread = threading.Thread(target=self.run_async_task, args=(locations, limit, concurrency, categories), daemon=True)
+        self.restart_btn.config(state=tk.NORMAL)
+        thread = threading.Thread(target=self.run_async_task, args=(locations, limit, concurrency, categories, output_file), daemon=True)
         thread.start()
 
-    def run_async_task(self, locations, limit, concurrency, categories):
+    def run_async_task(self, locations, limit, concurrency, categories, output_file):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_scraper(locations, limit, ".", concurrency, stop_check=lambda: self.stop_requested, categories=categories))
+            loop.run_until_complete(run_scraper(locations, limit, ".", concurrency, stop_check=lambda: self.stop_requested, categories=categories, output_file=output_file))
         except Exception as e:
             print(f"\nError occurred: {e}")
         finally:
@@ -192,8 +213,14 @@ class ScraperGUI:
     def on_scraping_finished(self):
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        msg = "Scraping task stopped." if self.stop_requested else "Scraping task completed."
-        messagebox.showinfo("Finished", msg)
+        self.restart_btn.config(state=tk.DISABLED)
+        if getattr(self, '_restart_after_stop', False):
+            self._restart_after_stop = False
+            print("\nRestarting scraper...")
+            self.start_scraping()
+        else:
+            msg = "Scraping task stopped." if self.stop_requested else "Scraping task completed."
+            messagebox.showinfo("Finished", msg)
 
 if __name__ == "__main__":
     root = tk.Tk()
