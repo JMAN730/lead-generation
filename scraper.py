@@ -141,10 +141,19 @@ async def scrape_gmaps(browser_context, search_query, max_results=50):
                 if url in visited_urls: continue
                 visited_urls.add(url)
 
-                name = await link.get_attribute("aria-label") or await link.inner_text()
+                aria_label = await link.get_attribute("aria-label") or ""
+                name = aria_label or await link.inner_text()
                 if is_chain(name): continue
 
-                found_places.append({"Name": name, "URL": url})
+                # Pull rating and review count directly from feed aria-label
+                # e.g. "Joe's Landscaping 4.7 stars 89 reviews · Landscaping · Toledo, OH"
+                feed_rating, feed_reviews = None, None
+                rv_match = re.search(r'([\d.]+)\s*stars?\s+([\d,]+)\s*reviews?', aria_label, re.IGNORECASE)
+                if rv_match:
+                    feed_rating = float(rv_match.group(1))
+                    feed_reviews = int(rv_match.group(2).replace(',', ''))
+
+                found_places.append({"Name": name, "URL": url, "Rating": feed_rating, "Reviews": feed_reviews})
 
             feed = await page.query_selector("div[role='feed']")
             if feed:
@@ -170,8 +179,9 @@ async def scrape_gmaps(browser_context, search_query, max_results=50):
                 "Phone": details["phone"],
                 "Website": details["website"],
                 "Email": details["email"],
-                "Rating": details["rating"],
-                "Reviews": details["reviews"]
+                # Prefer feed data (fast & reliable); fall back to detail-page extraction
+                "Rating": place["Rating"] if place["Rating"] is not None else details["rating"],
+                "Reviews": place["Reviews"] if place["Reviews"] is not None else details["reviews"]
             })
 
     return final_results
