@@ -22,7 +22,7 @@ EXCLUDED_CHAINS = [
 
 CATEGORIES = [
     "Mobile Mechanics",
-    "Power washing ",
+    "Power washing",
     "landscaping",
     "Tree Removal",
     "Cleaning",
@@ -33,10 +33,14 @@ CATEGORIES = [
 
 EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
+_CHAIN_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(c) for c in EXCLUDED_CHAINS) + r')\b',
+    re.IGNORECASE
+)
+
 def is_chain(name):
     if not name: return False
-    name_lower = name.lower()
-    return any(chain in name_lower for chain in EXCLUDED_CHAINS)
+    return bool(_CHAIN_RE.search(name))
 
 def is_social_media(url):
     if not url: return False
@@ -104,7 +108,7 @@ async def get_business_details(browser_context, maps_url, semaphore):
                     if rating_el:
                         aria = await rating_el.get_attribute("aria-label")
                         if aria:
-                            r = re.search(r'([\d.]+)\s*star', aria, re.IGNORECASE)
+                            r = re.search(r'\b([\d.]+)\b\s*star', aria, re.IGNORECASE)
                             if r:
                                 details["rating"] = float(r.group(1))
         except Exception as e:
@@ -114,7 +118,7 @@ async def get_business_details(browser_context, maps_url, semaphore):
                 await page.close()
         return details
 
-async def scrape_gmaps(browser_context, search_query, max_results=50):
+async def scrape_gmaps(browser_context, search_query, max_results=50, stop_check=None):
     page = await browser_context.new_page()
     print(f"Searching: {search_query}")
     try:
@@ -132,6 +136,7 @@ async def scrape_gmaps(browser_context, search_query, max_results=50):
         visited_urls = set()
 
         while len(found_places) < max_results:
+            if stop_check and stop_check(): break
             links = await page.query_selector_all("a[href^='https://www.google.com/maps/place/']")
             if not links: break
 
@@ -201,7 +206,8 @@ def load_progress(output_dir):
         try:
             with open(progress_path, 'r') as f:
                 return set(tuple(x) for x in json.load(f))
-        except:
+        except Exception as e:
+            print(f"Warning: Could not read progress file ({e}). Starting fresh — all categories will be re-scraped.")
             return set()
     return set()
 
@@ -210,7 +216,7 @@ def save_progress(output_dir, completed_set):
     with open(progress_path, 'w') as f:
         json.dump(list(completed_set), f)
 
-async def process_category(browser_context, http_client, location, category, limit, output_dir, existing_leads, progress_set, output_file):
+async def process_category(browser_context, http_client, location, category, limit, output_dir, existing_leads, progress_set, output_file, stop_check=None):
     if (location, category) in progress_set:
         print(f"Skipping {category} in {location} (already completed)")
         return
@@ -219,7 +225,7 @@ async def process_category(browser_context, http_client, location, category, lim
     print(f"\n--- Processing: {search_query} ---")
 
     try:
-        data = await asyncio.wait_for(scrape_gmaps(browser_context, search_query, limit), timeout=180)
+        data = await asyncio.wait_for(scrape_gmaps(browser_context, search_query, limit, stop_check=stop_check), timeout=180)
     except asyncio.TimeoutError:
         print(f"Timed out scraping {category} in {location}. Skipping (will retry on next run).")
         return
@@ -259,16 +265,13 @@ async def process_category(browser_context, http_client, location, category, lim
         df_new["Category"] = category
         df_new["Location"] = location
 
-        if os.path.exists(output_path):
-            df_existing = pd.read_csv(output_path)
-            df_final = pd.concat([df_existing, df_new], ignore_index=True).drop_duplicates(subset=["Name", "Phone"])
-        else:
-            df_final = df_new
-
         cols = ["Name", "Phone", "Email", "Website", "Rating", "Reviews", "Category", "Location"]
-        df_final = df_final[[c for c in cols if c in df_final.columns]]
+        df_new = df_new[[c for c in cols if c in df_new.columns]]
 
-        df_final.to_csv(output_path, index=False)
+        # Append-only: existing_leads set already deduplicates in-memory,
+        # so we never need to re-read the file to check for duplicates.
+        write_header = not os.path.exists(output_path)
+        df_new.to_csv(output_path, mode='a', header=write_header, index=False)
         for l in new_leads:
             existing_leads.add((l["Name"], l["Phone"]))
         print(f"Saved {len(new_leads)} new leads for {category} in {location}.")
@@ -283,6 +286,10 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
         categories = CATEGORIES
     if output_file is None:
         output_file = f"leads_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    # Strip any path components and ensure .csv extension to block path traversal
+    output_file = os.path.basename(output_file)
+    if not output_file.endswith('.csv'):
+        output_file += '.csv'
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Output file: {os.path.join(output_dir, output_file)}")
@@ -305,12 +312,12 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
                     chunks = [categories[i:i + concurrency] for i in range(0, len(categories), concurrency)]
                     for chunk in chunks:
                         if stop_check and stop_check(): break
-                        tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set, output_file) for cat in chunk]
+                        tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set, output_file, stop_check=stop_check) for cat in chunk]
                         await asyncio.gather(*tasks)
                 else:
                     for category in categories:
                         if stop_check and stop_check(): break
-                        await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set, output_file)
+                        await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set, output_file, stop_check=stop_check)
 
         await browser.close()
 
