@@ -34,9 +34,19 @@ class ScraperGUI:
         self.stop_requested = False
         self._restart_after_stop = False
         self.create_widgets()
-        
-        # Redirect stdout
-        sys.stdout = StreamToQueue(self.log_area)
+
+        # Redirect stdout and stderr to the GUI log area; restore on close
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        stream = StreamToQueue(self.log_area)
+        sys.stdout = stream
+        sys.stderr = stream
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def on_close(self):
+        sys.stdout = self._original_stdout
+        sys.stderr = self._original_stderr
+        self.root.destroy()
 
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="10")
