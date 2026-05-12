@@ -28,7 +28,8 @@ CATEGORIES = [
     "Cleaning",
     "Concrete",
     "Fencing Companies",
-    "Barbers"
+    "Barbers",
+    "Roofers"
 ]
 
 EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
@@ -186,7 +187,8 @@ async def scrape_gmaps(browser_context, search_query, max_results=50, stop_check
                 "Email": details["email"],
                 # Prefer feed data (fast & reliable); fall back to detail-page extraction
                 "Rating": place["Rating"] if place["Rating"] is not None else details["rating"],
-                "Reviews": place["Reviews"] if place["Reviews"] is not None else details["reviews"]
+                "Reviews": place["Reviews"] if place["Reviews"] is not None else details["reviews"],
+                "Google Maps URL": place["URL"]
             })
 
     return final_results
@@ -251,7 +253,8 @@ async def process_category(browser_context, http_client, location, category, lim
                 "Email": b["Email"],
                 "Website": b["Website"],
                 "Rating": b.get("Rating"),
-                "Reviews": b.get("Reviews")
+                "Reviews": b.get("Reviews"),
+                "Google Maps URL": b.get("Google Maps URL")
             }
         return None
 
@@ -265,7 +268,7 @@ async def process_category(browser_context, http_client, location, category, lim
         df_new["Category"] = category
         df_new["Location"] = location
 
-        cols = ["Name", "Phone", "Email", "Website", "Rating", "Reviews", "Category", "Location"]
+        cols = ["Name", "Phone", "Email", "Website", "Rating", "Reviews", "Google Maps URL", "Category", "Location"]
         df_new = df_new[[c for c in cols if c in df_new.columns]]
 
         # Append-only: existing_leads set already deduplicates in-memory,
