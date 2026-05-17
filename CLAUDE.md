@@ -32,11 +32,17 @@ python scraper.py --file cities_ohio.txt --limit 20 --concurrency 2
 # CLI flags
 #   --limit N           max results per category (default: 20)
 #   --concurrency N     categories processed in parallel (default: 1)
-#   --output-dir DIR    directory for CSV and progress.json (default: .)
+#   --output-dir DIR    directory for CSV and <output-file>.progress.json (default: .)
 #   --output-file NAME  custom CSV filename (default: leads_YYYYMMDD_HHMMSS.csv)
 ```
 
-There are no automated tests or linters configured in this project.
+Run the lightweight unit tests with:
+
+```bash
+python -m unittest
+```
+
+There is no linter configured in this project.
 
 ## Architecture
 
@@ -53,11 +59,11 @@ The project has two entry points that share one async core:
 
 2. **`get_business_details()`** opens a fresh page per business (up to 5 concurrent via `asyncio.Semaphore`) and extracts phone, email, website, and rating/reviews from the Maps detail panel. Rating extraction has three fallback strategies: inline text regex → alternate line pattern → `aria-label` attribute on the star element.
 
-3. **`check_website()`** makes an HTTP GET with `httpx` (up to 10 concurrent). Returns `True` only for HTTP 200 on a real, non-social-media URL. **Leads are saved only when this returns `False`** — the tool targets businesses without a working website.
+3. **`check_website()`** normalizes website URLs, rejects Google/social/non-web URLs, and makes an HTTP GET with `httpx` (up to 10 concurrent). It treats successful redirects and common access-control/rate-limit responses as evidence that a site exists. **Leads are saved only when this returns `False`** — the tool targets businesses without a working website.
 
-4. Results are appended to CSV via `pandas`. Deduplication uses an in-memory `set` of `(Name, Phone)` tuples loaded once at startup — the file is never re-read during a run.
+4. Results are appended to CSV via `pandas`. Deduplication uses an in-memory `set` of `(Name, Phone)` tuples loaded once at startup. A shared `asyncio.Lock` protects CSV appends, progress writes, and dedupe state when category concurrency is enabled.
 
-5. Progress is persisted in `progress.json` (list of `[location, category]` pairs) after each category completes, enabling resumable runs.
+5. Progress is persisted next to the CSV as `<output-file-stem>.progress.json` (list of `[location, category]` pairs) after each category completes. This keeps resumable state scoped to the selected output file.
 
 ### GUI threading model (gui.py)
 

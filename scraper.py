@@ -1,13 +1,14 @@
 import asyncio
 import pandas as pd
 import httpx
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 import sys
 import argparse
 import re
 import os
 import json
 from datetime import datetime
+from urllib.parse import quote_plus, urlparse
 
 # List of popular chains to exclude
 EXCLUDED_CHAINS = [
@@ -43,23 +44,45 @@ def is_chain(name):
     if not name: return False
     return bool(_CHAIN_RE.search(name))
 
+def warn(message):
+    print(f"Warning: {message}", file=sys.stderr)
+
 def is_social_media(url):
     if not url: return False
     social_domains = ["facebook.com", "instagram.com", "linkedin.com", "twitter.com", "t.co", "youtube.com", "tiktok.com"]
     return any(domain in url.lower() for domain in social_domains)
 
+def normalize_website_url(url):
+    if not url:
+        return None
+
+    url = url.strip()
+    if not url or url.startswith("/"):
+        return None
+
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        url = f"https://{url}"
+        parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    return url
+
 async def check_website(client, url, semaphore):
     """Returns True ONLY if the business has a VALID, NON-SOCIAL website."""
+    url = normalize_website_url(url)
     if not url: return False
-    if "google.com" in url.lower() or url.startswith("/"): return False
+    if "google.com" in url.lower(): return False
     if is_social_media(url): return False
     
     async with semaphore:
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
             response = await client.get(url, timeout=10.0, follow_redirects=True, headers=headers)
-            return response.status_code == 200
-        except:
+            return response.status_code < 400 or response.status_code in {401, 403, 405, 429}
+        except httpx.HTTPError:
             return False
 
 async def get_business_details(browser_context, maps_url, semaphore):
@@ -112,8 +135,8 @@ async def get_business_details(browser_context, maps_url, semaphore):
                             r = re.search(r'\b([\d.]+)\b\s*star', aria, re.IGNORECASE)
                             if r:
                                 details["rating"] = float(r.group(1))
-        except Exception as e:
-            pass
+        except PlaywrightError as e:
+            warn(f"Could not read business details for {maps_url}: {e}")
         finally:
             if not page.is_closed():
                 await page.close()
@@ -123,15 +146,18 @@ async def scrape_gmaps(browser_context, search_query, max_results=50, stop_check
     page = await browser_context.new_page()
     print(f"Searching: {search_query}")
     try:
-        await page.goto(f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}")
+        await page.goto(f"https://www.google.com/maps/search/{quote_plus(search_query)}")
 
         try:
             consent = await page.wait_for_selector("button:has-text('Accept all')", timeout=5000)
             if consent: await consent.click()
-        except: pass
+        except PlaywrightTimeoutError:
+            pass
 
-        try: await page.wait_for_selector("div[role='feed']", timeout=15000)
-        except: pass
+        try:
+            await page.wait_for_selector("div[role='feed']", timeout=15000)
+        except PlaywrightTimeoutError:
+            warn(f"Search results feed did not load for '{search_query}' within 15 seconds.")
 
         found_places = []
         visited_urls = set()
@@ -198,12 +224,17 @@ def load_existing_leads(output_path):
         try:
             df = pd.read_csv(output_path)
             return set(zip(df['Name'], df['Phone']))
-        except:
+        except (OSError, KeyError, pd.errors.ParserError) as e:
+            warn(f"Could not read existing leads from {output_path}: {e}")
             return set()
     return set()
 
-def load_progress(output_dir):
-    progress_path = os.path.join(output_dir, "progress.json")
+def get_progress_path(output_dir, output_file):
+    output_name = os.path.splitext(os.path.basename(output_file))[0]
+    return os.path.join(output_dir, f"{output_name}.progress.json")
+
+def load_progress(output_dir, output_file):
+    progress_path = get_progress_path(output_dir, output_file)
     if os.path.exists(progress_path):
         try:
             with open(progress_path, 'r') as f:
@@ -213,15 +244,16 @@ def load_progress(output_dir):
             return set()
     return set()
 
-def save_progress(output_dir, completed_set):
-    progress_path = os.path.join(output_dir, "progress.json")
+def save_progress(output_dir, output_file, completed_set):
+    progress_path = get_progress_path(output_dir, output_file)
     with open(progress_path, 'w') as f:
         json.dump(list(completed_set), f)
 
-async def process_category(browser_context, http_client, location, category, limit, output_dir, existing_leads, progress_set, output_file, stop_check=None):
-    if (location, category) in progress_set:
-        print(f"Skipping {category} in {location} (already completed)")
-        return
+async def process_category(browser_context, http_client, location, category, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=None):
+    async with state_lock:
+        if (location, category) in progress_set:
+            print(f"Skipping {category} in {location} (already completed)")
+            return
 
     search_query = f"{category} in {location}"
     print(f"\n--- Processing: {search_query} ---")
@@ -234,16 +266,18 @@ async def process_category(browser_context, http_client, location, category, lim
 
     if not data:
         print(f"No businesses with phone numbers found for {category} in {location}.")
-        progress_set.add((location, category))
-        save_progress(output_dir, progress_set)
+        async with state_lock:
+            progress_set.add((location, category))
+            save_progress(output_dir, output_file, progress_set)
         return
 
     # Parallel website check
     check_semaphore = asyncio.Semaphore(10)
 
     async def process_lead(b):
-        if (b["Name"], b["Phone"]) in existing_leads:
-            return None
+        async with state_lock:
+            if (b["Name"], b["Phone"]) in existing_leads:
+                return None
 
         is_valid_ws = await check_website(http_client, b["Website"], check_semaphore)
         if not is_valid_ws:
@@ -261,30 +295,42 @@ async def process_category(browser_context, http_client, location, category, lim
     tasks = [process_lead(b) for b in data]
     new_leads = [r for r in await asyncio.gather(*tasks) if r]
 
-    if new_leads:
-        output_path = os.path.join(output_dir, output_file)
+    async with state_lock:
+        fresh_leads = []
+        fresh_keys = []
+        for lead in new_leads:
+            key = (lead["Name"], lead["Phone"])
+            if key in existing_leads or key in fresh_keys:
+                continue
+            fresh_keys.append(key)
+            fresh_leads.append(lead)
 
-        df_new = pd.DataFrame(new_leads)
-        df_new["Category"] = category
-        df_new["Location"] = location
+        if fresh_leads:
+            output_path = os.path.join(output_dir, output_file)
 
-        cols = ["Name", "Phone", "Email", "Website", "Rating", "Reviews", "Google Maps URL", "Category", "Location"]
-        df_new = df_new[[c for c in cols if c in df_new.columns]]
+            df_new = pd.DataFrame(fresh_leads)
+            df_new["Category"] = category
+            df_new["Location"] = location
 
-        # Append-only: existing_leads set already deduplicates in-memory,
-        # so we never need to re-read the file to check for duplicates.
-        write_header = not os.path.exists(output_path)
-        df_new.to_csv(output_path, mode='a', header=write_header, index=False)
-        for l in new_leads:
-            existing_leads.add((l["Name"], l["Phone"]))
-        print(f"Saved {len(new_leads)} new leads for {category} in {location}.")
-    else:
-        print(f"No new leads found for {category} in {location}.")
+            cols = ["Name", "Phone", "Email", "Website", "Rating", "Reviews", "Google Maps URL", "Category", "Location"]
+            df_new = df_new[[c for c in cols if c in df_new.columns]]
 
-    progress_set.add((location, category))
-    save_progress(output_dir, progress_set)
+            write_header = not os.path.exists(output_path)
+            df_new.to_csv(output_path, mode='a', header=write_header, index=False)
+            existing_leads.update(fresh_keys)
+            print(f"Saved {len(fresh_leads)} new leads for {category} in {location}.")
+        else:
+            print(f"No new leads found for {category} in {location}.")
+
+        progress_set.add((location, category))
+        save_progress(output_dir, output_file, progress_set)
 
 async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None, categories=None, output_file=None):
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+
     if categories is None:
         categories = CATEGORIES
     if output_file is None:
@@ -296,9 +342,11 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Output file: {os.path.join(output_dir, output_file)}")
+    print(f"Progress file: {get_progress_path(output_dir, output_file)}")
 
-    progress_set = load_progress(output_dir)
+    progress_set = load_progress(output_dir, output_file)
     existing_leads = load_existing_leads(os.path.join(output_dir, output_file))
+    state_lock = asyncio.Lock()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -315,12 +363,12 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
                     chunks = [categories[i:i + concurrency] for i in range(0, len(categories), concurrency)]
                     for chunk in chunks:
                         if stop_check and stop_check(): break
-                        tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set, output_file, stop_check=stop_check) for cat in chunk]
+                        tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=stop_check) for cat in chunk]
                         await asyncio.gather(*tasks)
                 else:
                     for category in categories:
                         if stop_check and stop_check(): break
-                        await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set, output_file, stop_check=stop_check)
+                        await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=stop_check)
 
         await browser.close()
 
@@ -338,6 +386,10 @@ async def main():
     parser.add_argument("--output-file", default=None, help="Filename for the CSV output (default: timestamped leads_YYYYMMDD_HHMMSS.csv)")
     parser.add_argument("--concurrency", type=int, default=1, help="Number of categories to process in parallel per location")
     args = parser.parse_args()
+    if args.limit < 1:
+        parser.error("--limit must be at least 1")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be at least 1")
 
     locations = []
     if args.file:

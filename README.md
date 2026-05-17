@@ -5,9 +5,9 @@ An autonomous tool designed to scrape Google Maps for businesses and identify po
 ## Features
 - **Dual Interface:** Use the command-line (CLI) or the built-in Graphical User Interface (GUI).
 - **Smart Filtering:** Automatically excludes major chains (McDonald's, Starbucks, etc.). You'll probably have to add more to this list in filter.txt
-- **Lead Validation:** Checks if a business's website is active. Only saves leads that need digital help.
+- **Lead Validation:** Checks whether a business has a reachable, non-social website before saving leads that need digital help.
 - **Data Capture:** Extracts Name, Phone, Email (if available), and Website.
-- **Deduplication:** Prevents duplicate entries and tracks progress across multiple runs.
+- **Deduplication:** Prevents duplicate entries, including during concurrent category runs, and tracks progress per output file.
 - **Parallel Processing:** Supports concurrent category scraping for faster results.
 
 ## Setup
@@ -46,6 +46,12 @@ python scraper.py "Toledo, Ohio" --limit 20
 - `--file`: Path to a `.txt` file with locations (one per line).
 - `--concurrency`: Number of categories to process in parallel (default: 1).
 - `--output-dir`: Directory to save the `leads.csv` (default: current directory).
+
+## Tests
+Run the lightweight unit tests with:
+```bash
+python -m unittest
+```
 
 ## Output
 The results are saved in `leads.csv` with the following columns:

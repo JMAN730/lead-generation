@@ -178,8 +178,20 @@ class ScraperGUI:
     def start_scraping(self):
         location = self.location_var.get().strip()
         file_path = self.file_var.get().strip()
-        limit = self.limit_var.get()
-        concurrency = self.concurrency_var.get()
+        try:
+            limit = self.limit_var.get()
+            concurrency = self.concurrency_var.get()
+        except tk.TclError:
+            messagebox.showerror("Error", "Limit and concurrency must be whole numbers.")
+            return
+
+        if limit < 1:
+            messagebox.showerror("Error", "Limit per category must be at least 1.")
+            return
+        if concurrency < 1:
+            messagebox.showerror("Error", "Concurrency must be at least 1.")
+            return
+
         output_file = self.output_file_var.get().strip() or None
 
         locations = []
