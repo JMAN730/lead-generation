@@ -10,6 +10,8 @@ leads.csv
 scraper.log
 progress.json
 *.progress.json
+*.progress.json.tmp
+*_summary.json
 *.csv
 
 # OS
