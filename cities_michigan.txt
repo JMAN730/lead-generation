@@ -1,0 +1,160 @@
+Adrian
+Albion
+Allegan
+Alma
+Alpena
+Ann Arbor
+Auburn Hills
+Bad Axe
+Bangor
+Battle Creek
+Bay City
+Belleville
+Benton Harbor
+Berkley
+Beverly Hills
+Big Rapids
+Birmingham
+Boyne City
+Brighton
+Bronson
+Buchanan
+Cadillac
+Caro
+Center Line
+Charlotte
+Cheboygan
+Chelsea
+Clare
+Clawson
+Coldwater
+Coleman
+Dearborn
+Dearborn Heights
+Detroit
+Dowagiac
+East Grand Rapids
+East Lansing
+Eastpointe
+Eaton Rapids
+Escanaba
+Farmington
+Farmington Hills
+Ferndale
+Flat Rock
+Flint
+Frankenmuth
+Fremont
+Garden City
+Gaylord
+Gibraltar
+Gladstone
+Grand Haven
+Grand Rapids
+Grandville
+Grayling
+Greenville
+Grosse Pointe
+Grosse Pointe Farms
+Grosse Pointe Park
+Grosse Pointe Woods
+Hamtramck
+Hancock
+Harper Woods
+Harrison
+Hastings
+Hazel Park
+Highland Park
+Hillsdale
+Holland
+Houghton
+Howell
+Hudson
+Huntington Woods
+Inkster
+Ionia
+Iron Mountain
+Iron River
+Ishpeming
+Jackson
+Kalamazoo
+Keego Harbor
+Kentwood
+Kingsford
+L'Anse
+Lansing
+Lapeer
+Lincoln Park
+Livonia
+Ludington
+Madison Heights
+Manistee
+Manistique
+Marine City
+Marquette
+Marshall
+Marysville
+Mason
+Menominee
+Midland
+Milan
+Monroe
+Mount Clemens
+Mount Morris
+Mount Pleasant
+Munising
+Muskegon
+Muskegon Heights
+Negaunee
+New Baltimore
+Niles
+Norton Shores
+Novi
+Oak Park
+Orchard Lake Village
+Owosso
+Petoskey
+Pleasant Ridge
+Plymouth
+Pontiac
+Port Huron
+Portage
+Reading
+Richmond
+River Rouge
+Riverview
+Rochester
+Rochester Hills
+Romulus
+Roseville
+Royal Oak
+Saginaw
+Saline
+Sandusky
+Sault Ste. Marie
+Southfield
+Southgate
+St. Clair
+St. Clair Shores
+St. Ignace
+St. Johns
+St. Joseph
+Sterling Heights
+Sturgis
+Swartz Creek
+Taylor
+Tecumseh
+Three Rivers
+Traverse City
+Trenton
+Troy
+Utica
+Walker
+Warren
+Wayne
+Westland
+Whitehall
+Wixom
+Wyoming
+Ypsilanti
+Zeeland
