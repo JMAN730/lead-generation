@@ -26,6 +26,9 @@ python gui.py
 # CLI — single location
 python scraper.py "Toledo, Ohio" --limit 20
 
+# CLI — Google Maps + Yelp (requires YELP_API_KEY)
+YELP_API_KEY=your_key python scraper.py "Toledo, Ohio" --sources google,yelp --limit 20
+
 # CLI — multiple locations from file
 python scraper.py --file cities_ohio.txt --limit 20 --concurrency 2
 
@@ -36,6 +39,7 @@ python scraper.py --file cities_ohio.txt --limit 20 --concurrency 2
 #   --output-file NAME  custom CSV filename (default: leads_YYYYMMDD_HHMMSS.csv)
 #   --categories-file F custom category list, one category per line
 #   --exclude-chains-file F custom chain exclusion list, one chain per line
+#   --sources LIST      comma-separated lead sources: google,yelp (default: google)
 #   --dry-run           validate leads without writing CSV or progress files
 #   --call-sheet        also write <output-file-stem>_call_sheet.csv
 #   --preset F          load run settings from a JSON preset
@@ -59,17 +63,19 @@ The project has two entry points that share one async core:
 
 ### Scraping pipeline (scraper.py)
 
-`run_scraper()` → `process_category()` → `scrape_gmaps()` + `get_business_details()` + `check_website()`
+`run_scraper()` → `process_category()` → `scrape_source()` → source adapter + `check_website()`
 
 1. **`scrape_gmaps()`** opens a Playwright page, navigates to `google.com/maps/search/…`, scrolls the feed, and collects `(name, url, rating, reviews)` tuples — rating/reviews are read from feed `aria-label` attributes here (fast path). Chain names are filtered via a precompiled regex (`_CHAIN_RE`) against `EXCLUDED_CHAINS`.
 
-2. **`get_business_details()`** opens a fresh page per business (up to 5 concurrent via `asyncio.Semaphore`) and extracts phone, email, website, and rating/reviews from the Maps detail panel. Rating extraction has three fallback strategies: inline text regex → alternate line pattern → `aria-label` attribute on the star element.
+2. **`scrape_yelp_api()`** uses the official Yelp API when `yelp` is selected in `--sources`. It requires `YELP_API_KEY`, normalizes Yelp results into the shared lead shape, and attempts lightweight Google Maps enrichment for website/email details.
 
-3. **`check_website()`** normalizes website URLs, rejects Google/social/non-web URLs, and makes an HTTP GET with `httpx` (up to 10 concurrent). It returns structured validation details (`is_valid`, normalized/final URL, HTTP status, and reason). Successful redirects and common access-control/rate-limit responses count as evidence that a site exists. **Leads are saved only when `is_valid` is `False`** — the tool targets businesses without a working website.
+3. **`get_business_details()`** opens a fresh page per business (up to 5 concurrent via `asyncio.Semaphore`) and extracts phone, email, website, and rating/reviews from the Maps detail panel. Rating extraction has three fallback strategies: inline text regex → alternate line pattern → `aria-label` attribute on the star element.
 
-4. Results are appended to CSV via `pandas`, including normalized phone/domain fields, website validation reason/status columns, and call-priority score/reason columns. Exported text fields are sanitized against spreadsheet formula injection before writing. Deduplication uses normalized phone, Google Maps URL, domain, and name+phone keys loaded once at startup. A shared `asyncio.Lock` protects CSV appends, call-sheet writes, progress writes, and dedupe state when category concurrency is enabled.
+4. **`check_website()`** normalizes website URLs, rejects Google/social/non-web URLs, and makes an HTTP GET with `httpx` (up to 10 concurrent). It returns structured validation details (`is_valid`, normalized/final URL, HTTP status, and reason). Facebook/social-only URLs are captured as profile context and scored as no standalone website. **Leads are saved only when `is_valid` is `False`** — the tool targets businesses without a working standalone website.
 
-5. Progress is atomically persisted next to the CSV as `<output-file-stem>.progress.json` (list of `[location, category]` pairs) after each category completes. This keeps resumable state scoped to the selected output file. Dry runs skip CSV and progress writes. Completed runs save `<output-file-stem>_summary.json`; `--call-sheet` also writes `<output-file-stem>_call_sheet.csv`.
+5. Results are appended to CSV via `pandas`, including normalized phone/domain fields, source fields, website validation reason/status columns, and call-priority score/reason columns. Exported text fields are sanitized against spreadsheet formula injection before writing. Deduplication uses normalized phone, source IDs/URLs, Google Maps URL, domain, and name+phone keys loaded once at startup. A shared `asyncio.Lock` protects CSV appends, call-sheet writes, progress writes, and dedupe state when category concurrency is enabled.
+
+6. Progress is atomically persisted next to the CSV as `<output-file-stem>.progress.json` after each source/category completes. New progress entries use `[source, location, category]`; old Google-only `[location, category]` entries are still treated as completed Google work. Dry runs skip CSV and progress writes. Completed runs save `<output-file-stem>_summary.json`; `--call-sheet` also writes `<output-file-stem>_call_sheet.csv`.
 
 ### GUI threading model (gui.py)
 

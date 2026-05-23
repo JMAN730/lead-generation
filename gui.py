@@ -104,6 +104,14 @@ class ScraperGUI:
         self.call_sheet_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(settings_frame, text="Create call sheet", variable=self.call_sheet_var).grid(row=5, column=1, padx=5, pady=5, sticky=tk.W)
 
+        ttk.Label(settings_frame, text="Sources:").grid(row=6, column=0, sticky=tk.W)
+        source_frame = ttk.Frame(settings_frame)
+        source_frame.grid(row=6, column=1, padx=5, pady=5, sticky=tk.W)
+        self.google_source_var = tk.BooleanVar(value=True)
+        self.yelp_source_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(source_frame, text="Google Maps", variable=self.google_source_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(source_frame, text="Yelp", variable=self.yelp_source_var).pack(side=tk.LEFT, padx=(10, 0))
+
         # Categories Editor
         cat_frame = ttk.LabelFrame(main_frame, text="Categories", padding="10")
         cat_frame.pack(fill=tk.X, pady=5)
@@ -211,6 +219,7 @@ class ScraperGUI:
             "categories": self.get_categories(),
             "dry_run": self.dry_run_var.get(),
             "call_sheet": self.call_sheet_var.get(),
+            "sources": self.get_sources(),
         }
 
     def load_preset_file(self):
@@ -228,6 +237,9 @@ class ScraperGUI:
             self.output_dir_var.set(preset.get("output_dir") or ".")
             self.dry_run_var.set(bool(preset.get("dry_run", False)))
             self.call_sheet_var.set(bool(preset.get("call_sheet", False)))
+            sources = preset.get("sources") or ["google"]
+            self.google_source_var.set("google" in sources)
+            self.yelp_source_var.set("yelp" in sources)
             if preset.get("categories"):
                 self.apply_categories(preset["categories"])
             elif preset.get("categories_file"):
@@ -282,6 +294,10 @@ class ScraperGUI:
         output_dir = self.output_dir_var.get().strip() or "."
         dry_run = self.dry_run_var.get()
         call_sheet = self.call_sheet_var.get()
+        sources = self.get_sources()
+        if not sources:
+            messagebox.showerror("Error", "Please select at least one source.")
+            return
 
         locations = []
         if file_path:
@@ -307,14 +323,22 @@ class ScraperGUI:
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.restart_btn.config(state=tk.NORMAL)
-        self._scraper_thread = threading.Thread(target=self.run_async_task, args=(locations, limit, concurrency, categories, output_file, output_dir, dry_run, call_sheet), daemon=True)
+        self._scraper_thread = threading.Thread(target=self.run_async_task, args=(locations, limit, concurrency, categories, output_file, output_dir, dry_run, call_sheet, sources), daemon=True)
         self._scraper_thread.start()
 
-    def run_async_task(self, locations, limit, concurrency, categories, output_file, output_dir, dry_run, call_sheet):
+    def get_sources(self):
+        sources = []
+        if self.google_source_var.get():
+            sources.append("google")
+        if self.yelp_source_var.get():
+            sources.append("yelp")
+        return sources
+
+    def run_async_task(self, locations, limit, concurrency, categories, output_file, output_dir, dry_run, call_sheet, sources):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_scraper(locations, limit, output_dir, concurrency, stop_check=lambda: self.stop_requested, categories=categories, output_file=output_file, dry_run=dry_run, call_sheet=call_sheet))
+            loop.run_until_complete(run_scraper(locations, limit, output_dir, concurrency, stop_check=lambda: self.stop_requested, categories=categories, output_file=output_file, dry_run=dry_run, call_sheet=call_sheet, sources=sources))
         except Exception as e:
             print(f"\nError occurred: {e}")
         finally:

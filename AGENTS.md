@@ -27,6 +27,9 @@ python gui.py
 # CLI - single location
 python scraper.py "Toledo, Ohio" --limit 20
 
+# CLI - Google Maps + Yelp (requires YELP_API_KEY)
+YELP_API_KEY=your_key python scraper.py "Toledo, Ohio" --sources google,yelp --limit 20
+
 # CLI - multiple locations from file
 python scraper.py --file cities_ohio.txt --limit 20 --concurrency 2
 
@@ -35,9 +38,23 @@ python scraper.py --file cities_ohio.txt --limit 20 --concurrency 2
 #   --concurrency N     categories processed in parallel (default: 1)
 #   --output-dir DIR    directory for CSV and progress.json (default: .)
 #   --output-file NAME  custom CSV filename (default: leads_YYYYMMDD_HHMMSS.csv)
+#   --sources LIST      comma-separated lead sources: google,yelp (default: google)
 ```
 
 ## Validation
+
+After making code changes, run the unit tests automatically before handing work back:
+
+```bash
+python -m unittest
+```
+
+If `python` is not available, use `python3 -m unittest`. If dependencies are missing and the project venv does not exist, create it with `python3 -m venv venv`, install `pip install -r requirements.txt`, then run tests through the venv. On Debian/Ubuntu hosts where `python3 -m venv` fails because `ensurepip` is missing, install `python3.12-venv` first or use the existing user-site fallback:
+
+```bash
+pip3 install --user --break-system-packages -r requirements.txt
+python3 -m unittest
+```
 
 Run the unit tests with:
 
@@ -62,17 +79,19 @@ The project has two entry points that share one async core:
 
 ### Scraping Pipeline
 
-`run_scraper()` -> `process_category()` -> `scrape_gmaps()` + `get_business_details()` + `check_website()`
+`run_scraper()` -> `process_category()` -> `scrape_source()` -> source adapter + `check_website()`
 
 1. **`scrape_gmaps()`** opens a Playwright page, navigates to `google.com/maps/search/...`, scrolls the feed, and collects business tuples. Rating and review counts are read from feed `aria-label` attributes as the fast path. Chain names are filtered via a precompiled regex (`_CHAIN_RE`) against `EXCLUDED_CHAINS`.
 
-2. **`get_business_details()`** opens a fresh page per business and extracts phone, email, website, rating, and reviews from the Maps detail panel. Rating extraction has fallback strategies for inline text, alternate line patterns, and star element `aria-label` attributes.
+2. **`scrape_yelp_api()`** uses the official Yelp API when the `yelp` source is selected. It requires `YELP_API_KEY`, normalizes Yelp businesses into the shared lead shape, and then attempts lightweight Google Maps enrichment for website/email details.
 
-3. **`check_website()`** makes an HTTP GET with `httpx`. It treats real reachable sites as valid and filters social/profile URLs. Leads are saved only when a business has no working website, because the tool targets businesses that need digital help.
+3. **`get_business_details()`** opens a fresh page per business and extracts phone, email, website, rating, and reviews from the Maps detail panel. Rating extraction has fallback strategies for inline text, alternate line patterns, and star element `aria-label` attributes.
 
-4. Results are appended to CSV via `pandas`. Deduplication uses an in-memory set loaded at startup and guarded during concurrent category writes.
+4. **`check_website()`** makes an HTTP GET with `httpx`. It treats real reachable sites as valid and filters social/profile URLs. Facebook/social-only URLs are captured as profile context and scored as no standalone website. Leads are saved only when a business has no working standalone website, because the tool targets businesses that need digital help.
 
-5. Progress is persisted beside each output CSV as `<output-name>.progress.json`, enabling resumable runs per output file.
+5. Results are appended to CSV via `pandas`. Deduplication uses an in-memory set loaded at startup and guarded during concurrent category writes.
+
+6. Progress is persisted beside each output CSV as `<output-name>.progress.json`, enabling resumable runs per output file. New entries are scoped by `(source, location, category)`; old Google-only progress entries remain compatible.
 
 ### GUI Threading Model
 

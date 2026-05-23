@@ -63,6 +63,9 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
             "Phone": "+1 (555) 111-2222",
             "Website": "www.example.com",
             "Google Maps URL": "https://maps.example/place/1",
+            "Yelp URL": "https://www.yelp.com/biz/acme",
+            "Source": "yelp",
+            "Source ID": "acme-id",
         }
 
         keys = scraper.get_lead_dedupe_keys(lead)
@@ -70,6 +73,8 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("phone:5551112222", keys)
         self.assertIn("domain:example.com", keys)
         self.assertIn("maps:https://maps.example/place/1", keys)
+        self.assertIn("yelp_id:acme-id", keys)
+        self.assertIn("yelp_url:https://www.yelp.com/biz/acme", keys)
 
     def test_preset_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -83,10 +88,21 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
     def test_preset_value_coercion(self):
         self.assertEqual(scraper.coerce_positive_int("2", "concurrency"), 2)
         self.assertEqual(scraper.coerce_string_list([" Toledo ", "", "Akron"], "locations"), ["Toledo", "Akron"])
+        self.assertEqual(scraper.coerce_sources("google,yelp"), ["google", "yelp"])
+        self.assertEqual(scraper.coerce_sources(["Google", "google"]), ["google"])
         with self.assertRaises(ValueError):
             scraper.coerce_positive_int("0", "limit")
         with self.assertRaises(ValueError):
             scraper.coerce_string_list("Toledo", "locations")
+        with self.assertRaises(ValueError):
+            scraper.coerce_sources("facebook")
+
+    def test_progress_supports_source_keys_and_old_google_keys(self):
+        progress = {("Toledo", "Roofers"), ("yelp", "Toledo", "Concrete")}
+
+        self.assertTrue(scraper.is_progress_done(progress, "google", "Toledo", "Roofers"))
+        self.assertTrue(scraper.is_progress_done(progress, "yelp", "Toledo", "Concrete"))
+        self.assertFalse(scraper.is_progress_done(progress, "yelp", "Toledo", "Roofers"))
 
     async def test_check_website_treats_blocked_real_sites_as_valid(self):
         async def handler(request):
@@ -115,6 +131,90 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["reason"], "TimeoutError")
         finally:
             scraper.WEBSITE_CHECK_TIMEOUT = original_timeout
+
+    async def test_yelp_api_normalizes_businesses(self):
+        async def handler(request):
+            self.assertEqual(request.headers["authorization"], "Bearer key")
+            return httpx.Response(200, json={
+                "businesses": [{
+                    "id": "biz-1",
+                    "name": "Local Roofer",
+                    "display_phone": "(555) 111-2222",
+                    "url": "https://www.yelp.com/biz/local-roofer",
+                    "rating": 4.5,
+                    "review_count": 42,
+                }]
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            results = await scraper.scrape_yelp_api(client, "Roofers in Toledo", "Toledo", "Roofers", api_key="key")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["Source"], "yelp")
+        self.assertEqual(results[0]["Source ID"], "biz-1")
+        self.assertEqual(results[0]["Website Reason Override"], "website_unknown")
+
+    async def test_yelp_api_paginates_to_requested_limit(self):
+        requests = []
+
+        async def handler(request):
+            params = request.url.params
+            limit = int(params["limit"])
+            offset = int(params["offset"])
+            requests.append((limit, offset))
+            businesses = []
+            for i in range(offset, offset + limit):
+                businesses.append({
+                    "id": f"biz-{i}",
+                    "name": f"Local Roofer {i}",
+                    "display_phone": f"(555) 111-{i:04d}",
+                    "url": f"https://www.yelp.com/biz/local-roofer-{i}",
+                })
+            return httpx.Response(200, json={"businesses": businesses, "total": 65})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            results = await scraper.scrape_yelp_api(client, "Roofers in Toledo", "Toledo", "Roofers", max_results=65, api_key="key")
+
+        self.assertEqual(len(results), 65)
+        self.assertEqual(requests, [(50, 0), (15, 50)])
+        self.assertEqual(results[-1]["Source ID"], "biz-64")
+
+    async def test_yelp_api_failure_raises_source_error(self):
+        async def handler(request):
+            return httpx.Response(429)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(scraper.SourceScrapeError):
+                await scraper.scrape_yelp_api(client, "Roofers in Toledo", "Toledo", "Roofers", api_key="key")
+
+    async def test_source_failure_does_not_save_progress(self):
+        async def fake_scrape_source(*args, **kwargs):
+            raise scraper.SourceScrapeError("Yelp search failed for 'Roofers in Toledo'")
+
+        original_scrape_source = scraper.scrape_source
+        scraper.scrape_source = fake_scrape_source
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                existing_leads = set()
+                progress_set = set()
+                state_lock = asyncio.Lock()
+                summary = scraper.create_run_summary(["Toledo"], ["Roofers"], "leads.csv")
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    await scraper.process_category(
+                        None, None, "Toledo", "Roofers", 1, tmp, existing_leads,
+                        progress_set, "leads.csv", state_lock, source="yelp", summary=summary
+                    )
+
+                self.assertEqual(progress_set, set())
+                self.assertFalse(os.path.exists(os.path.join(tmp, "leads.progress.json")))
+                self.assertEqual(summary["categories_completed"], 0)
+        finally:
+            scraper.scrape_source = original_scrape_source
+
+    async def test_run_scraper_requires_yelp_api_key(self):
+        with self.assertRaisesRegex(ValueError, "YELP_API_KEY"):
+            await scraper.run_scraper(["Toledo"], sources=["yelp"], summary_report=False)
 
     async def test_concurrent_categories_do_not_duplicate_csv_rows(self):
         async def fake_scrape(browser_context, search_query, limit, stop_check=None, chain_regex=None):
@@ -153,9 +253,10 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(df.loc[0, "Name"], "'=Same Lead")
                 self.assertEqual(str(df.loc[0, "Normalized Phone"]), "5551112222")
                 self.assertEqual(df.loc[0, "Website Reason"], "missing_or_invalid_url")
+                self.assertEqual(df.loc[0, "Source"], "google")
                 self.assertEqual(df.loc[0, "Call Priority"], "Medium")
                 self.assertEqual(summary["duplicates_skipped"], 1)
-                self.assertEqual(progress_set, {("Toledo", "Roofers"), ("Toledo", "Concrete")})
+                self.assertEqual(progress_set, {("google", "Toledo", "Roofers"), ("google", "Toledo", "Concrete")})
         finally:
             scraper.scrape_gmaps = original_scrape
             scraper.check_website = original_check
@@ -196,6 +297,7 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(call_sheet.loc[0, "Call Priority"], "High")
                 self.assertEqual(str(call_sheet.loc[0, "Normalized Phone"]), "5553334444")
                 self.assertEqual(summary["leads_written"], 1)
+                self.assertEqual(summary["by_source"]["google"], 1)
                 self.assertEqual(summary["by_website_reason"]["missing_or_invalid_url"], 1)
         finally:
             scraper.scrape_gmaps = original_scrape
@@ -235,6 +337,35 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
         finally:
             scraper.scrape_gmaps = original_scrape
             scraper.check_website = original_check
+
+    async def test_facebook_url_is_captured_as_social_profile(self):
+        async def fake_scrape(browser_context, search_query, limit, stop_check=None, chain_regex=None):
+            return [{
+                "Name": "Facebook Only Lead",
+                "Phone": "555-222-3333",
+                "Email": None,
+                "Website": "https://www.facebook.com/facebookonlylead",
+                "Rating": None,
+                "Reviews": None,
+                "Google Maps URL": "https://maps.example/place",
+            }]
+
+        original_scrape = scraper.scrape_gmaps
+        scraper.scrape_gmaps = fake_scrape
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                existing_leads = set()
+                progress_set = set()
+                state_lock = asyncio.Lock()
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    await scraper.process_category(None, None, "Toledo", "Roofers", 1, tmp, existing_leads, progress_set, "leads.csv", state_lock)
+
+                df = pd.read_csv(os.path.join(tmp, "leads.csv"))
+                self.assertEqual(df.loc[0, "Website Reason"], "social_media")
+                self.assertEqual(df.loc[0, "Facebook URL"], "https://www.facebook.com/facebookonlylead")
+        finally:
+            scraper.scrape_gmaps = original_scrape
 
 
 if __name__ == "__main__":

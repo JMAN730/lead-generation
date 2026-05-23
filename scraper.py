@@ -38,6 +38,9 @@ EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 SOCIAL_DOMAINS = ["facebook.com", "instagram.com", "linkedin.com", "twitter.com", "t.co", "youtube.com", "tiktok.com"]
 VALID_BLOCKED_STATUSES = {401, 403, 405, 429}
 WEBSITE_CHECK_TIMEOUT = 12.0
+VALID_SOURCES = ("google", "yelp")
+DEFAULT_SOURCES = ["google"]
+YELP_SEARCH_URL = "https://api.yelp.com/v3/businesses/search"
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 CALL_SHEET_COLUMNS = [
     "Call Priority",
@@ -54,8 +57,15 @@ CALL_SHEET_COLUMNS = [
     "Reviews",
     "Website",
     "Website Domain",
+    "Source",
+    "Source URL",
     "Google Maps URL",
+    "Yelp URL",
+    "Facebook URL",
 ]
+
+class SourceScrapeError(Exception):
+    """Raised when a source search fails before producing reliable results."""
 
 def build_chain_regex(chains):
     chains = [chain.strip() for chain in chains if chain and chain.strip()]
@@ -78,6 +88,13 @@ def is_social_media(url):
     hostname = urlparse(url).hostname or ""
     hostname = hostname.lower()
     return any(hostname == domain or hostname.endswith(f".{domain}") for domain in SOCIAL_DOMAINS)
+
+def is_facebook_url(url):
+    if not url:
+        return False
+    hostname = urlparse(normalize_website_url(url) or "").hostname or ""
+    hostname = hostname.lower()
+    return hostname == "facebook.com" or hostname.endswith(".facebook.com")
 
 def normalize_website_url(url):
     if not url:
@@ -186,6 +203,29 @@ async def get_business_details(browser_context, maps_url, semaphore):
                 await page.close()
         return details
 
+async def find_first_gmaps_url(browser_context, search_query):
+    page = await browser_context.new_page()
+    try:
+        await page.goto(f"https://www.google.com/maps/search/{quote_plus(search_query)}")
+        try:
+            consent = await page.wait_for_selector("button:has-text('Accept all')", timeout=3000)
+            if consent:
+                await consent.click()
+        except PlaywrightTimeoutError:
+            pass
+        try:
+            await page.wait_for_selector("a[href^='https://www.google.com/maps/place/']", timeout=8000)
+        except PlaywrightTimeoutError:
+            return None
+        link = await page.query_selector("a[href^='https://www.google.com/maps/place/']")
+        return await link.get_attribute("href") if link else None
+    except PlaywrightError as e:
+        warn(f"Could not enrich from Google Maps for '{search_query}': {e}")
+        return None
+    finally:
+        if not page.is_closed():
+            await page.close()
+
 async def scrape_gmaps(browser_context, search_query, max_results=50, stop_check=None, chain_regex=None):
     page = await browser_context.new_page()
     print(f"Searching: {search_query}")
@@ -258,10 +298,111 @@ async def scrape_gmaps(browser_context, search_query, max_results=50, stop_check
                 # Prefer feed data (fast & reliable); fall back to detail-page extraction
                 "Rating": place["Rating"] if place["Rating"] is not None else details["rating"],
                 "Reviews": place["Reviews"] if place["Reviews"] is not None else details["reviews"],
-                "Google Maps URL": place["URL"]
+                "Google Maps URL": place["URL"],
+                "Source": "google",
+                "Source URL": place["URL"],
             })
 
     return final_results
+
+async def scrape_yelp_api(http_client, search_query, location, category, max_results=50, api_key=None, chain_regex=None):
+    if not api_key:
+        raise ValueError("Yelp source selected but YELP_API_KEY is not set")
+    if max_results < 1:
+        return []
+
+    print(f"Searching Yelp: {search_query}")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    businesses = []
+    offset = 0
+    while len(businesses) < max_results:
+        page_limit = min(max_results - len(businesses), 50)
+        params = {
+            "term": category,
+            "location": location,
+            "limit": page_limit,
+            "offset": offset,
+        }
+        try:
+            response = await http_client.get(YELP_SEARCH_URL, headers=headers, params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            warn(f"Yelp search failed for '{search_query}': HTTP {e.response.status_code}")
+            raise SourceScrapeError(f"Yelp search failed for '{search_query}'") from e
+        except httpx.HTTPError as e:
+            warn(f"Yelp search failed for '{search_query}': {e.__class__.__name__}")
+            raise SourceScrapeError(f"Yelp search failed for '{search_query}'") from e
+
+        payload = response.json()
+        page_businesses = payload.get("businesses", [])
+        if not page_businesses:
+            break
+        businesses.extend(page_businesses)
+        offset += len(page_businesses)
+        total = payload.get("total")
+        if len(page_businesses) < page_limit or (total is not None and offset >= total):
+            break
+
+    results = []
+    for business in businesses:
+        name = business.get("name")
+        if is_chain(name, chain_regex):
+            continue
+        phone = business.get("display_phone") or business.get("phone")
+        if not phone:
+            continue
+        yelp_url = business.get("url")
+        results.append({
+            "Name": name,
+            "Phone": phone,
+            "Website": None,
+            "Email": None,
+            "Rating": business.get("rating"),
+            "Reviews": business.get("review_count"),
+            "Google Maps URL": None,
+            "Yelp URL": yelp_url,
+            "Source": "yelp",
+            "Source URL": yelp_url,
+            "Source ID": business.get("id"),
+            "Website Reason Override": "website_unknown",
+        })
+    print(f"Collected {len(results)} Yelp businesses with phone numbers for '{search_query}'.")
+    return results
+
+async def enrich_yelp_results(browser_context, yelp_results, location, stop_check=None):
+    if not yelp_results:
+        return yelp_results
+    print(f"Enriching {len(yelp_results)} Yelp businesses with Google Maps details...")
+    details_semaphore = asyncio.Semaphore(3)
+    for business in yelp_results:
+        if stop_check and stop_check():
+            break
+        maps_url = await find_first_gmaps_url(browser_context, f"{business['Name']} {location}")
+        if not maps_url:
+            continue
+        details = await get_business_details(browser_context, maps_url, details_semaphore)
+        business["Google Maps URL"] = maps_url
+        if details.get("website"):
+            business["Website"] = details["website"]
+            business.pop("Website Reason Override", None)
+        if details.get("email"):
+            business["Email"] = details["email"]
+        if details.get("phone"):
+            business["Phone"] = details["phone"]
+        if business.get("Rating") is None:
+            business["Rating"] = details.get("rating")
+        if business.get("Reviews") is None:
+            business["Reviews"] = details.get("reviews")
+    return yelp_results
+
+async def scrape_source(source, browser_context, http_client, location, category, limit, stop_check=None, chain_regex=None, yelp_api_key=None):
+    search_query = f"{category} in {location}"
+    if source == "google":
+        return await scrape_gmaps(browser_context, search_query, limit, stop_check=stop_check, chain_regex=chain_regex)
+    if source == "yelp":
+        yelp_results = await scrape_yelp_api(http_client, search_query, location, category, limit, api_key=yelp_api_key, chain_regex=chain_regex)
+        return await enrich_yelp_results(browser_context, yelp_results, location, stop_check=stop_check)
+    raise ValueError(f"unknown source: {source}")
 
 def load_existing_leads(output_path):
     if os.path.exists(output_path):
@@ -292,10 +433,35 @@ def normalize_domain(url):
     hostname = hostname.lower()
     return hostname[4:] if hostname.startswith("www.") else hostname
 
+def coerce_sources(value):
+    if value is None:
+        return list(DEFAULT_SOURCES)
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, list):
+        parts = value
+    else:
+        raise ValueError("sources must be a comma-separated string or list")
+
+    sources = []
+    for item in parts:
+        source = str(item).strip().lower()
+        if not source:
+            continue
+        if source not in VALID_SOURCES:
+            raise ValueError(f"unknown source '{source}'. Valid sources: {', '.join(VALID_SOURCES)}")
+        if source not in sources:
+            sources.append(source)
+    if not sources:
+        raise ValueError("at least one source is required")
+    return sources
+
 def get_lead_dedupe_keys(lead):
     keys = set()
     phone = normalize_phone(lead.get("Phone"))
     maps_url = lead.get("Google Maps URL")
+    yelp_id = lead.get("Source ID") if lead.get("Source") == "yelp" else lead.get("Yelp ID")
+    yelp_url = lead.get("Yelp URL")
     domain = normalize_domain(lead.get("Website"))
     name = str(lead.get("Name") or "").strip().lower()
 
@@ -303,6 +469,10 @@ def get_lead_dedupe_keys(lead):
         keys.add(f"phone:{phone}")
     if maps_url:
         keys.add(f"maps:{maps_url}")
+    if yelp_id:
+        keys.add(f"yelp_id:{yelp_id}")
+    if yelp_url:
+        keys.add(f"yelp_url:{yelp_url}")
     if domain:
         keys.add(f"domain:{domain}")
     if name and phone:
@@ -322,6 +492,9 @@ def score_lead(lead):
     elif website_reason in {"social_media", "google_url"}:
         score += 30
         reasons.append("no standalone website")
+    elif website_reason == "website_unknown":
+        score += 15
+        reasons.append("website unknown")
     elif website_reason:
         score += 25
         reasons.append(f"website issue: {website_reason}")
@@ -439,6 +612,15 @@ def load_progress(output_dir, output_file):
             return set()
     return set()
 
+def progress_key(source, location, category):
+    return (source, location, category)
+
+def is_progress_done(progress_set, source, location, category):
+    key = progress_key(source, location, category)
+    if key in progress_set:
+        return True
+    return source == "google" and (location, category) in progress_set
+
 def save_progress(output_dir, output_file, completed_set):
     progress_path = get_progress_path(output_dir, output_file)
     temp_path = f"{progress_path}.tmp"
@@ -454,12 +636,13 @@ def get_summary_path(output_dir, output_file):
     output_name = os.path.splitext(os.path.basename(output_file))[0]
     return os.path.join(output_dir, f"{output_name}_summary.json")
 
-def create_run_summary(locations, categories, output_file):
+def create_run_summary(locations, categories, output_file, sources=None):
     return {
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "completed_at": None,
         "locations": list(locations),
         "categories": list(categories),
+        "sources": list(sources or DEFAULT_SOURCES),
         "output_file": output_file,
         "categories_started": 0,
         "categories_completed": 0,
@@ -472,6 +655,7 @@ def create_run_summary(locations, categories, output_file):
         "dry_run": False,
         "by_category": {},
         "by_location": {},
+        "by_source": {},
         "by_website_reason": {},
     }
 
@@ -513,32 +697,42 @@ def print_run_summary(summary):
         print(f"- Dry-run leads: {summary.get('dry_run_leads', 0)}")
     print(f"- Duplicates skipped: {summary.get('duplicates_skipped', 0)}")
     print(f"- Valid websites skipped: {summary.get('valid_websites_skipped', 0)}")
+    if summary.get("by_source"):
+        source_counts = ", ".join(f"{k}: {v}" for k, v in sorted(summary["by_source"].items()))
+        print(f"- Businesses by source: {source_counts}")
 
-async def process_category(browser_context, http_client, location, category, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=None, chain_regex=None, dry_run=False, call_sheet=False, summary=None):
+async def process_category(browser_context, http_client, location, category, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=None, chain_regex=None, dry_run=False, call_sheet=False, summary=None, source="google", yelp_api_key=None):
     async with state_lock:
-        if (location, category) in progress_set:
-            print(f"Skipping {category} in {location} (already completed)")
+        if is_progress_done(progress_set, source, location, category):
+            print(f"Skipping {source}:{category} in {location} (already completed)")
             return
         increment_summary(summary, "categories_started")
         increment_nested(summary, "by_category", category, 0)
         increment_nested(summary, "by_location", location, 0)
+        increment_nested(summary, "by_source", source, 0)
 
     search_query = f"{category} in {location}"
-    print(f"\n--- Processing: {search_query} ---")
+    print(f"\n--- Processing {source}: {search_query} ---")
 
     try:
-        data = await asyncio.wait_for(scrape_gmaps(browser_context, search_query, limit, stop_check=stop_check, chain_regex=chain_regex), timeout=180)
+        data = await asyncio.wait_for(
+            scrape_source(source, browser_context, http_client, location, category, limit, stop_check=stop_check, chain_regex=chain_regex, yelp_api_key=yelp_api_key),
+            timeout=180,
+        )
     except asyncio.TimeoutError:
-        print(f"Timed out scraping {category} in {location}. Skipping (will retry on next run).")
+        print(f"Timed out scraping {source}:{category} in {location}. Skipping (will retry on next run).")
+        return
+    except SourceScrapeError as e:
+        print(f"{e}. Skipping (will retry on next run).")
         return
 
     if not data:
-        print(f"No businesses with phone numbers found for {category} in {location}.")
+        print(f"No businesses with phone numbers found for {source}:{category} in {location}.")
         if dry_run:
-            print(f"Dry run: progress not updated for {category} in {location}.")
+            print(f"Dry run: progress not updated for {source}:{category} in {location}.")
         else:
             async with state_lock:
-                progress_set.add((location, category))
+                progress_set.add(progress_key(source, location, category))
                 save_progress(output_dir, output_file, progress_set)
         async with state_lock:
             increment_summary(summary, "categories_completed")
@@ -548,6 +742,7 @@ async def process_category(browser_context, http_client, location, category, lim
         increment_summary(summary, "businesses_with_phone", len(data))
         increment_nested(summary, "by_category", category, len(data))
         increment_nested(summary, "by_location", location, len(data))
+        increment_nested(summary, "by_source", source, len(data))
 
     # Parallel website check
     check_semaphore = asyncio.Semaphore(10)
@@ -558,9 +753,12 @@ async def process_category(browser_context, http_client, location, category, lim
                 return {"status": "duplicate"}
 
         website_check = await check_website(http_client, b["Website"], check_semaphore)
+        if b.get("Website Reason Override") and website_check["reason"] == "missing_or_invalid_url":
+            website_check["reason"] = b["Website Reason Override"]
         if website_check["is_valid"]:
             return {"status": "valid_website"}
 
+        facebook_url = b.get("Facebook URL") or (b.get("Website") if is_facebook_url(b.get("Website")) else None)
         return {
             "status": "lead",
             "lead": add_priority_fields({
@@ -575,7 +773,12 @@ async def process_category(browser_context, http_client, location, category, lim
                 "Website Reason": website_check["reason"],
                 "Rating": b.get("Rating"),
                 "Reviews": b.get("Reviews"),
-                "Google Maps URL": b.get("Google Maps URL")
+                "Source": b.get("Source", source),
+                "Source URL": b.get("Source URL") or b.get("Google Maps URL") or b.get("Yelp URL"),
+                "Source ID": b.get("Source ID"),
+                "Google Maps URL": b.get("Google Maps URL"),
+                "Yelp URL": b.get("Yelp URL"),
+                "Facebook URL": facebook_url,
             })
         }
 
@@ -620,7 +823,7 @@ async def process_category(browser_context, http_client, location, category, lim
             df_new["Category"] = category
             df_new["Location"] = location
 
-            cols = ["Name", "Phone", "Normalized Phone", "Email", "Website", "Website Domain", "Website Checked URL", "Website Status", "Website Reason", "Call Priority", "Priority Score", "Priority Reason", "Rating", "Reviews", "Google Maps URL", "Category", "Location"]
+            cols = ["Name", "Phone", "Normalized Phone", "Email", "Website", "Website Domain", "Website Checked URL", "Website Status", "Website Reason", "Call Priority", "Priority Score", "Priority Reason", "Rating", "Reviews", "Source", "Source URL", "Source ID", "Google Maps URL", "Yelp URL", "Facebook URL", "Category", "Location"]
             df_new = df_new[[c for c in cols if c in df_new.columns]]
             df_new = sanitize_csv_frame(df_new)
 
@@ -641,16 +844,16 @@ async def process_category(browser_context, http_client, location, category, lim
             if not dry_run:
                 print(f"Saved {len(fresh_leads)} new leads for {category} in {location}.")
         else:
-            print(f"No new leads found for {category} in {location}.")
+            print(f"No new leads found for {source}:{category} in {location}.")
 
         if dry_run:
-            print(f"Dry run: progress not updated for {category} in {location}.")
+            print(f"Dry run: progress not updated for {source}:{category} in {location}.")
         else:
-            progress_set.add((location, category))
+            progress_set.add(progress_key(source, location, category))
             save_progress(output_dir, output_file, progress_set)
         increment_summary(summary, "categories_completed")
 
-async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None, categories=None, output_file=None, excluded_chains=None, dry_run=False, call_sheet=False, summary_report=True):
+async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None, categories=None, output_file=None, excluded_chains=None, dry_run=False, call_sheet=False, summary_report=True, sources=None):
     if limit < 1:
         raise ValueError("limit must be at least 1")
     if concurrency < 1:
@@ -660,6 +863,10 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
         categories = CATEGORIES
     if not categories:
         raise ValueError("at least one category is required")
+    sources = coerce_sources(sources)
+    yelp_api_key = os.environ.get("YELP_API_KEY")
+    if "yelp" in sources and not yelp_api_key:
+        raise ValueError("Yelp source selected but YELP_API_KEY is not set")
     if excluded_chains is None:
         excluded_chains = EXCLUDED_CHAINS
     chain_regex = build_chain_regex(excluded_chains)
@@ -674,6 +881,7 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
 
     print(f"Output file: {os.path.join(output_dir, output_file)}")
     print(f"Progress file: {get_progress_path(output_dir, output_file)}")
+    print(f"Sources: {', '.join(sources)}")
     if call_sheet:
         print(f"Call sheet: {get_call_sheet_path(output_dir, output_file)}")
     if dry_run:
@@ -682,7 +890,7 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
     progress_set = load_progress(output_dir, output_file)
     existing_leads = load_existing_leads(os.path.join(output_dir, output_file))
     state_lock = asyncio.Lock()
-    summary = create_run_summary(locations, categories, output_file)
+    summary = create_run_summary(locations, categories, output_file, sources=sources)
     summary["dry_run"] = dry_run
 
     async with async_playwright() as p:
@@ -696,16 +904,18 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
                 print(f"Location: {location}")
                 print(f"{'#'*60}")
 
-                if concurrency > 1:
-                    chunks = [categories[i:i + concurrency] for i in range(0, len(categories), concurrency)]
-                    for chunk in chunks:
-                        if stop_check and stop_check(): break
-                        tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=stop_check, chain_regex=chain_regex, dry_run=dry_run, call_sheet=call_sheet, summary=summary) for cat in chunk]
-                        await asyncio.gather(*tasks)
-                else:
-                    for category in categories:
-                        if stop_check and stop_check(): break
-                        await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=stop_check, chain_regex=chain_regex, dry_run=dry_run, call_sheet=call_sheet, summary=summary)
+                for source in sources:
+                    if stop_check and stop_check(): break
+                    if concurrency > 1:
+                        chunks = [categories[i:i + concurrency] for i in range(0, len(categories), concurrency)]
+                        for chunk in chunks:
+                            if stop_check and stop_check(): break
+                            tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=stop_check, chain_regex=chain_regex, dry_run=dry_run, call_sheet=call_sheet, summary=summary, source=source, yelp_api_key=yelp_api_key) for cat in chunk]
+                            await asyncio.gather(*tasks)
+                    else:
+                        for category in categories:
+                            if stop_check and stop_check(): break
+                            await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=stop_check, chain_regex=chain_regex, dry_run=dry_run, call_sheet=call_sheet, summary=summary, source=source, yelp_api_key=yelp_api_key)
 
         await browser.close()
 
@@ -732,6 +942,7 @@ async def main():
     parser.add_argument("--exclude-chains-file", help="File containing chain names to exclude (one per line)")
     parser.add_argument("--dry-run", action="store_true", help="Run searches and validation without writing CSV or progress files")
     parser.add_argument("--call-sheet", action="store_true", help="Also write a call-ready CSV sorted by priority within each batch")
+    parser.add_argument("--sources", default=None, help="Comma-separated lead sources to search: google,yelp (default: google)")
     parser.add_argument("--preset", help="Load run settings from a JSON preset")
     parser.add_argument("--save-preset", help="Save the resolved run settings to a JSON preset and exit")
     args = parser.parse_args()
@@ -746,6 +957,7 @@ async def main():
     output_file = args.output_file if args.output_file is not None else preset.get("output_file")
     dry_run = args.dry_run or bool(preset.get("dry_run", False))
     call_sheet = args.call_sheet or bool(preset.get("call_sheet", False))
+    sources_value = args.sources if args.sources is not None else preset.get("sources")
     categories_file = args.categories_file or preset.get("categories_file")
     exclude_chains_file = args.exclude_chains_file or preset.get("exclude_chains_file")
     file_path = args.file or preset.get("file")
@@ -770,6 +982,7 @@ async def main():
     try:
         categories = load_lines_file(categories_file) if categories_file else coerce_string_list(preset.get("categories"), "categories")
         excluded_chains = load_lines_file(exclude_chains_file) if exclude_chains_file else coerce_string_list(preset.get("excluded_chains"), "excluded_chains")
+        sources = coerce_sources(sources_value)
     except ValueError as e:
         parser.error(str(e))
     if categories is not None and not categories:
@@ -784,6 +997,7 @@ async def main():
             "concurrency": concurrency,
             "categories": categories,
             "excluded_chains": excluded_chains,
+            "sources": sources,
             "dry_run": dry_run,
             "call_sheet": call_sheet,
         })
@@ -800,6 +1014,7 @@ async def main():
         excluded_chains=excluded_chains,
         dry_run=dry_run,
         call_sheet=call_sheet,
+        sources=sources,
     )
 
 if __name__ == "__main__":
