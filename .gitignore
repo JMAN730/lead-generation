@@ -5,6 +5,12 @@ __pycache__/
 venv/
 .env
 
+# Coverage / test artifacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
 # Project Specific
 leads.csv
 scraper.log
