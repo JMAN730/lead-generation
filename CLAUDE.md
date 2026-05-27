@@ -46,13 +46,25 @@ python scraper.py --file cities_ohio.txt --limit 20 --concurrency 2
 #   --save-preset F     save resolved run settings to a JSON preset and exit
 ```
 
-Run the lightweight unit tests with:
+## Testing & validation
+
+Run the unit tests after any code change before handing work back:
 
 ```bash
 python -m unittest
 ```
 
-There is no linter configured in this project.
+Use `python3 -m unittest` where `python` is unavailable. There is no linter configured in this project.
+
+- Tests live in `tests/test_scraper.py` and use `unittest.IsolatedAsyncioTestCase` for the async cases. The package marker is `tests/__init__.py`.
+- Network and browser work is never hit live. Tests monkeypatch module-level functions (`scraper.scrape_gmaps`, `scraper.check_website`, `scraper.scrape_source`) and use `httpx.MockTransport` for HTTP/Yelp paths. Follow this pattern when adding tests — do not make real network calls.
+- Most behavioral tests drive `process_category()` against a `tempfile.TemporaryDirectory()` and assert on the written CSV, call sheet, progress file, and summary counters.
+- CI (`.github/workflows/test.yml`) runs on every push and pull request with Python 3.12: it installs `requirements.txt`, installs the Playwright Chromium browser, runs `python -m pip check`, `python -m unittest`, then `python -m compileall scraper.py gui.py tests`. Keep all four green.
+
+## Related docs
+
+- `README.md` — user-facing setup, usage, and output column reference.
+- `AGENTS.md` — parallel guidance for other coding agents; keep its architecture notes roughly in sync with this file when behavior changes.
 
 ## Architecture
 
@@ -71,11 +83,15 @@ The project has two entry points that share one async core:
 
 3. **`get_business_details()`** opens a fresh page per business (up to 5 concurrent via `asyncio.Semaphore`) and extracts phone, email, website, and rating/reviews from the Maps detail panel. Rating extraction has three fallback strategies: inline text regex → alternate line pattern → `aria-label` attribute on the star element.
 
-4. **`check_website()`** normalizes website URLs, rejects Google/social/non-web URLs, and makes an HTTP GET with `httpx` (up to 10 concurrent). It returns structured validation details (`is_valid`, normalized/final URL, HTTP status, and reason). Facebook/social-only URLs are captured as profile context and scored as no standalone website. **Leads are saved only when `is_valid` is `False`** — the tool targets businesses without a working standalone website.
+4. **`check_website()`** normalizes website URLs, rejects Google/social/non-web URLs, and makes an HTTP GET with `httpx` (up to 10 concurrent). It returns structured validation details (`is_valid`, normalized/final URL, HTTP status, and reason). Status codes below 400 (and the blocked-but-real set `401/403/405/429` in `VALID_BLOCKED_STATUSES`) count as valid. Facebook/social-only URLs are captured as profile context and scored as no standalone website. **Leads are saved only when `is_valid` is `False`** — the tool targets businesses without a working standalone website.
 
-5. Results are appended to CSV via `pandas`, including normalized phone/domain fields, source fields, website validation reason/status columns, and call-priority score/reason columns. Exported text fields are sanitized against spreadsheet formula injection before writing. Deduplication uses normalized phone, source IDs/URLs, Google Maps URL, domain, and name+phone keys loaded once at startup. A shared `asyncio.Lock` protects CSV appends, call-sheet writes, progress writes, and dedupe state when category concurrency is enabled.
+5. **`score_lead()`** assigns each lead a `Priority Score` (0–100, clamped), a `Call Priority` bucket (High ≥70, Medium ≥45, else Low), and a human-readable `Priority Reason`. Inputs are the website reason, review count, rating, and phone/email presence — strongest signal is a missing/social-only website plus review history.
 
-6. Progress is atomically persisted next to the CSV as `<output-file-stem>.progress.json` after each source/category completes. New progress entries use `[source, location, category]`; old Google-only `[location, category]` entries are still treated as completed Google work. Dry runs skip CSV and progress writes. Completed runs save `<output-file-stem>_summary.json`; `--call-sheet` also writes `<output-file-stem>_call_sheet.csv`.
+6. Results are appended to CSV via `pandas`, including normalized phone/domain fields, source fields, website validation reason/status columns, and call-priority score/reason columns. Column order is fixed in `process_category()`; the call sheet uses `CALL_SHEET_COLUMNS`. Exported text fields are sanitized against spreadsheet formula injection (leading `= + - @` etc.) before writing. Deduplication (`get_lead_dedupe_keys()`) uses normalized phone, source IDs/URLs, Google Maps URL, domain, and name+phone keys loaded once at startup. A shared `asyncio.Lock` protects CSV appends, call-sheet writes, progress writes, and dedupe state when category concurrency is enabled.
+
+7. Progress is atomically persisted next to the CSV as `<output-file-stem>.progress.json` after each source/category completes. New progress entries use `[source, location, category]`; old Google-only `[location, category]` entries are still treated as completed Google work. Per-category work is wrapped in a 180 s `asyncio.wait_for`; a timeout or a retryable `SourceScrapeError` (e.g. Yelp HTTP/network failure) is logged and **does not** mark the category complete, so it retries on the next run. Dry runs skip CSV and progress writes. Completed runs save `<output-file-stem>_summary.json`; `--call-sheet` also writes `<output-file-stem>_call_sheet.csv`.
+
+`run_scraper()` strips path components from `--output-file` (via `os.path.basename`) and forces a `.csv` extension to block path traversal. Output filenames default to `leads_YYYYMMDD_HHMMSS.csv`.
 
 ### GUI threading model (gui.py)
 
