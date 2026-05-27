@@ -18,6 +18,20 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(scraper.normalize_website_url("/maps/place/foo"))
         self.assertIsNone(scraper.normalize_website_url("mailto:test@example.com"))
 
+    def test_extract_email_skips_asset_references(self):
+        self.assertEqual(
+            scraper.extract_email("Reach the owner at info@joesroofing.com today"),
+            "info@joesroofing.com",
+        )
+        self.assertIsNone(scraper.extract_email("logo@2x.png"))
+        self.assertIsNone(scraper.extract_email("hero@3x.webp banner@2x.jpg"))
+        self.assertEqual(
+            scraper.extract_email("sprite@2x.png owner@example.com"),
+            "owner@example.com",
+        )
+        self.assertIsNone(scraper.extract_email(None))
+        self.assertIsNone(scraper.extract_email("no address here"))
+
     def test_progress_is_scoped_to_output_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             scraper.save_progress(tmp, "leads_a.csv", {("Toledo", "Roofers")})

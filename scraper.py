@@ -35,6 +35,12 @@ CATEGORIES = [
 ]
 
 EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+# Extensions that mean an EMAIL_REGEX match is really an asset reference
+# (e.g. "logo@2x.png"), not an address. None are valid email TLDs.
+NON_EMAIL_EXTENSIONS = {
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "tif", "tiff",
+    "avif", "css", "js", "json", "mp4", "webm", "woff", "woff2",
+}
 SOCIAL_DOMAINS = ["facebook.com", "instagram.com", "linkedin.com", "twitter.com", "t.co", "youtube.com", "tiktok.com"]
 VALID_BLOCKED_STATUSES = {401, 403, 405, 429}
 WEBSITE_CHECK_TIMEOUT = 12.0
@@ -114,6 +120,18 @@ def normalize_website_url(url):
 
     return url
 
+def extract_email(text):
+    """Return the first real-looking email in text, skipping asset references
+    such as "logo@2x.png" that EMAIL_REGEX would otherwise match."""
+    if not text:
+        return None
+    for match in re.finditer(EMAIL_REGEX, text):
+        candidate = match.group(0)
+        if candidate.rsplit(".", 1)[-1].lower() in NON_EMAIL_EXTENSIONS:
+            continue
+        return candidate
+    return None
+
 async def check_website(client, url, semaphore):
     """Returns website validation details for a business URL."""
     url = normalize_website_url(url)
@@ -171,9 +189,7 @@ async def get_business_details(browser_context, maps_url, semaphore):
                     match = re.search(r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text)
                     if match: details["phone"] = match.group(0)
 
-                email_match = re.search(EMAIL_REGEX, text)
-                if email_match:
-                    details["email"] = email_match.group(0)
+                details["email"] = extract_email(text)
 
                 ws_el = await panel.query_selector("a[data-item-id='authority'], a[aria-label*='website'], a[aria-label*='Website']")
                 if ws_el:
