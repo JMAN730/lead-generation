@@ -869,7 +869,7 @@ async def process_category(browser_context, http_client, location, category, lim
             save_progress(output_dir, output_file, progress_set)
         increment_summary(summary, "categories_completed")
 
-async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None, categories=None, output_file=None, excluded_chains=None, dry_run=False, call_sheet=False, summary_report=True, sources=None):
+async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_check=None, categories=None, output_file=None, excluded_chains=None, dry_run=False, call_sheet=False, summary_report=True, sources=None, progress_callback=None):
     if limit < 1:
         raise ValueError("limit must be at least 1")
     if concurrency < 1:
@@ -909,6 +909,19 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
     summary = create_run_summary(locations, categories, output_file, sources=sources)
     summary["dry_run"] = dry_run
 
+    progress_total = len(locations) * len(sources) * len(categories)
+    progress_done = 0
+
+    def report_progress(event, **fields):
+        if progress_callback is None:
+            return
+        try:
+            progress_callback({"event": event, "done": progress_done, "total": progress_total, **fields})
+        except Exception:
+            pass
+
+    report_progress("run_start")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -926,16 +939,24 @@ async def run_scraper(locations, limit=20, output_dir=".", concurrency=1, stop_c
                         chunks = [categories[i:i + concurrency] for i in range(0, len(categories), concurrency)]
                         for chunk in chunks:
                             if stop_check and stop_check(): break
+                            report_progress("category_start", location=location, source=source, category=", ".join(chunk))
                             tasks = [process_category(context, client, location, cat, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=stop_check, chain_regex=chain_regex, dry_run=dry_run, call_sheet=call_sheet, summary=summary, source=source, yelp_api_key=yelp_api_key) for cat in chunk]
                             await asyncio.gather(*tasks)
+                            progress_done += len(chunk)
+                            report_progress("category_done", location=location, source=source)
                     else:
                         for category in categories:
                             if stop_check and stop_check(): break
+                            report_progress("category_start", location=location, source=source, category=category)
                             await process_category(context, client, location, category, limit, output_dir, existing_leads, progress_set, output_file, state_lock, stop_check=stop_check, chain_regex=chain_regex, dry_run=dry_run, call_sheet=call_sheet, summary=summary, source=source, yelp_api_key=yelp_api_key)
+                            progress_done += 1
+                            report_progress("category_done", location=location, source=source)
 
         await browser.close()
 
-    if stop_check and stop_check():
+    stopped = bool(stop_check and stop_check())
+    report_progress("run_end", stopped=stopped)
+    if stopped:
         print("\nScraping stopped by user.")
     else:
         print(f"\nAll searches completed. Results are in: {output_dir}")
